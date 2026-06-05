@@ -6,6 +6,13 @@
 #include <string.h>
 #include <unistd.h>
 
+#ifdef HAVE_PIPEWIRE
+#include <glib-unix.h>
+#include <pipewire/pipewire.h>
+#include <spa/param/audio/format-utils.h>
+#include <spa/param/props.h>
+#endif
+
 #define PORTAL_BUS "org.freedesktop.portal.Desktop"
 #define PORTAL_PATH "/org/freedesktop/portal/desktop"
 #define SCREENCAST_IFACE "org.freedesktop.portal.ScreenCast"
@@ -14,6 +21,9 @@
 
 #define SCREENCAST_SOURCE_MONITOR 1u
 #define SCREENCAST_PERSIST_PERMANENT 2u
+
+#define TARGET_SAMPLE_RATE 24000
+#define TARGET_CHANNELS 1
 
 typedef enum {
     MODE_PROBE = 0,
@@ -43,7 +53,15 @@ typedef struct {
     gboolean requested_restore_token;
     gboolean result_printed;
     int exit_code;
+#ifdef HAVE_PIPEWIRE
+    struct pw_thread_loop *pw_loop;
+    struct pw_stream *pw_stream;
+#endif
 } Helper;
+
+#ifdef HAVE_PIPEWIRE
+static volatile sig_atomic_t got_signal = 0;
+#endif
 
 static void json_print_escaped(FILE *stream, const char *value)
 {
@@ -89,6 +107,7 @@ static void json_print_nullable_string(FILE *stream, const char *value)
 {
     if (!value) {
         fputs("null", stream);
+
         return;
     }
 
@@ -106,11 +125,16 @@ static void print_probe_json(const Helper *app)
     fputs(app->supports_restore_token ? "true" : "false", stdout);
     fputs(",\"supportsSystemAudio\":", stdout);
     fputs(app->supports_system_audio ? "true" : "false", stdout);
+#ifdef HAVE_PIPEWIRE
+    fputs(",\"supportsNativeCapture\":true", stdout);
+#else
     fputs(",\"supportsNativeCapture\":false", stdout);
+#endif
 
     if (!app->probe_ok) {
         const char *message = "portal_unavailable";
         fputs(",\"error\":", stdout);
+
         json_print_escaped(stdout, message);
     }
 
@@ -212,19 +236,24 @@ static gboolean get_portal_uint_property(GDBusConnection *conn, const char *prop
         return FALSE;
     }
 
-    GVariant *value = NULL;
-    g_variant_get(result, "(@v)", &value);
+    GVariant *wrapped = NULL;
+    g_variant_get(result, "(@v)", &wrapped);
+
+    GVariant *value = wrapped;
+    if (value && g_variant_is_of_type(value, G_VARIANT_TYPE_VARIANT)) {
+        value = g_variant_get_variant(wrapped);
+    }
 
     if (!value || !g_variant_is_of_type(value, G_VARIANT_TYPE_UINT32)) {
-        if (value) {
-            g_variant_unref(value);
-        }
+        if (value && value != wrapped) g_variant_unref(value);
+        if (wrapped) g_variant_unref(wrapped);
         g_variant_unref(result);
         return FALSE;
     }
 
     *value_out = g_variant_get_uint32(value);
-    g_variant_unref(value);
+    if (value != wrapped) g_variant_unref(value);
+    g_variant_unref(wrapped);
     g_variant_unref(result);
     return TRUE;
 }
@@ -271,6 +300,139 @@ static void finish_start(Helper *app, int exit_code)
         g_main_loop_quit(app->loop);
     }
 }
+
+#ifdef HAVE_PIPEWIRE
+static void on_pw_process(void *userdata)
+{
+    Helper *app = userdata;
+    struct pw_buffer *b = pw_stream_dequeue_buffer(app->pw_stream);
+    if (!b) return;
+
+    struct spa_buffer *buf = b->buffer;
+    if (buf->n_datas == 0 || !buf->datas[0].data) {
+        pw_stream_queue_buffer(app->pw_stream, b);
+        return;
+    }
+
+    const void *src = buf->datas[0].data;
+    uint32_t offs = SPA_MIN(buf->datas[0].chunk->offset, buf->datas[0].maxsize);
+    uint32_t size = SPA_MIN(buf->datas[0].chunk->size, buf->datas[0].maxsize - offs);
+
+    if (size > 0) {
+        const uint8_t *ptr = (const uint8_t *)src + offs;
+        fwrite(ptr, 1, size, stdout);
+    }
+
+    pw_stream_queue_buffer(app->pw_stream, b);
+}
+
+static void on_pw_state_changed(void *userdata, enum pw_stream_state old,
+                                enum pw_stream_state state, const char *error)
+{
+    (void)old;
+    Helper *app = userdata;
+
+    if (state == PW_STREAM_STATE_ERROR) {
+        emit_event("error", "pipewire_error", error ? error : "PipeWire stream error", NULL);
+        got_signal = 1;
+        finish_start(app, 2);
+    }
+}
+
+static const struct pw_stream_events pw_stream_events = {
+    PW_VERSION_STREAM_EVENTS,
+    .process = on_pw_process,
+    .state_changed = on_pw_state_changed,
+};
+
+static gboolean on_unix_signal(gpointer user_data)
+{
+    Helper *app = user_data;
+    got_signal = 1;
+    finish_start(app, 0);
+    return G_SOURCE_REMOVE;
+}
+
+static gboolean run_pipewire_capture(Helper *app)
+{
+    setvbuf(stdout, NULL, _IONBF, 0);
+    pw_init(NULL, NULL);
+
+    app->pw_loop = pw_thread_loop_new("ow-capture", NULL);
+    if (!app->pw_loop) {
+        emit_event("error", "pipewire_error", "Failed to create PipeWire loop", NULL);
+        return FALSE;
+    }
+
+    struct pw_properties *props = pw_properties_new(
+        PW_KEY_MEDIA_TYPE, "Audio",
+        PW_KEY_MEDIA_CATEGORY, "Capture",
+        PW_KEY_MEDIA_ROLE, "Communication",
+        PW_KEY_STREAM_CAPTURE_SINK, "true",
+        NULL);
+
+    app->pw_stream = pw_stream_new_simple(
+        pw_thread_loop_get_loop(app->pw_loop),
+        "openwhispr-system-audio",
+        props,
+        &pw_stream_events,
+        app);
+
+    if (!app->pw_stream) {
+        emit_event("error", "pipewire_error", "Failed to create PipeWire stream", NULL);
+        pw_thread_loop_destroy(app->pw_loop);
+        app->pw_loop = NULL;
+        return FALSE;
+    }
+
+    uint8_t params_buffer[1024];
+    struct spa_pod_builder b = SPA_POD_BUILDER_INIT(params_buffer, sizeof(params_buffer));
+    const struct spa_pod *params[1];
+    params[0] = spa_format_audio_raw_build(&b, SPA_PARAM_EnumFormat,
+        &SPA_AUDIO_INFO_RAW_INIT(
+            .format = SPA_AUDIO_FORMAT_S16_LE,
+            .channels = TARGET_CHANNELS,
+            .rate = TARGET_SAMPLE_RATE));
+
+    int res = pw_stream_connect(app->pw_stream,
+        PW_DIRECTION_INPUT,
+        PW_ID_ANY,
+        PW_STREAM_FLAG_AUTOCONNECT | PW_STREAM_FLAG_MAP_BUFFERS,
+        params, 1);
+
+    if (res < 0) {
+        emit_event("error", "pipewire_error", "Failed to connect PipeWire stream", NULL);
+        pw_stream_destroy(app->pw_stream);
+        app->pw_stream = NULL;
+        pw_thread_loop_destroy(app->pw_loop);
+        app->pw_loop = NULL;
+        return FALSE;
+    }
+
+    pw_thread_loop_start(app->pw_loop);
+
+    g_unix_signal_add(SIGTERM, on_unix_signal, app);
+    g_unix_signal_add(SIGINT, on_unix_signal, app);
+
+    return TRUE;
+}
+
+static void cleanup_pipewire(Helper *app)
+{
+    if (app->pw_stream) {
+        pw_thread_loop_lock(app->pw_loop);
+        pw_stream_destroy(app->pw_stream);
+        pw_thread_loop_unlock(app->pw_loop);
+        app->pw_stream = NULL;
+    }
+    if (app->pw_loop) {
+        pw_thread_loop_stop(app->pw_loop);
+        pw_thread_loop_destroy(app->pw_loop);
+        app->pw_loop = NULL;
+    }
+    pw_deinit();
+}
+#endif
 
 static void on_start_response(GDBusConnection *conn, const char *sender, const char *object_path,
                               const char *interface_name, const char *signal_name,
@@ -441,13 +603,26 @@ static void on_start_response(GDBusConnection *conn, const char *sender, const c
         return;
     }
 
-    emit_event("start", NULL, NULL, restore_token);
-
     if (app->requested_restore_token && !restore_token) {
         emit_event("warning", "restore_failed",
                    "Restore token was supplied but the portal did not return a replacement token",
                    NULL);
     }
+
+#ifdef HAVE_PIPEWIRE
+    gchar *restore_copy = restore_token ? g_strdup(restore_token) : NULL;
+    if (restore_value) g_variant_unref(restore_value);
+    g_variant_unref(results);
+
+    if (!run_pipewire_capture(app)) {
+        g_free(restore_copy);
+        finish_start(app, 2);
+    } else {
+        emit_event("start", NULL, NULL, restore_copy);
+        g_free(restore_copy);
+    }
+#else
+    emit_event("start", NULL, NULL, restore_token);
 
     emit_event("warning", "capture_unimplemented",
                "Native PipeWire PCM capture is not implemented in this helper yet", NULL);
@@ -457,6 +632,7 @@ static void on_start_response(GDBusConnection *conn, const char *sender, const c
     }
     g_variant_unref(results);
     finish_start(app, 2);
+#endif
 }
 
 static gboolean run_probe(void)
@@ -501,7 +677,7 @@ static gboolean run_grant(void)
     GError *error = NULL;
     g_dbus_connection_call_sync(
         app.conn, PORTAL_BUS, PORTAL_PATH, SCREENCAST_IFACE, "CreateSession",
-        g_variant_new("(a{sv})", g_variant_builder_end(&opts)),
+        g_variant_new("(@a{sv})", g_variant_builder_end(&opts)),
         NULL, G_DBUS_CALL_FLAGS_NONE, -1, NULL, &error);
 
     if (error) {
@@ -560,7 +736,7 @@ static gboolean run_start(const char *restore_token)
     GError *error = NULL;
     g_dbus_connection_call_sync(
         app.conn, PORTAL_BUS, PORTAL_PATH, SCREENCAST_IFACE, "CreateSession",
-        g_variant_new("(a{sv})", g_variant_builder_end(&opts)),
+        g_variant_new("(@a{sv})", g_variant_builder_end(&opts)),
         NULL, G_DBUS_CALL_FLAGS_NONE, -1, NULL, &error);
 
     if (error) {
@@ -572,6 +748,9 @@ static gboolean run_start(const char *restore_token)
         g_main_loop_run(app.loop);
     }
 
+#ifdef HAVE_PIPEWIRE
+    cleanup_pipewire(&app);
+#endif
     g_clear_object(&app.conn);
     g_main_loop_unref(app.loop);
     g_free(app.restore_token);
@@ -623,4 +802,3 @@ int main(int argc, char *argv[])
 
     print_usage();
     return 1;
-}
