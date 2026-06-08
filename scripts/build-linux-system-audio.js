@@ -76,16 +76,18 @@ function isBinaryUpToDate() {
       )
       .digest("hex");
 
-    if (fs.existsSync(hashFile)) {
-      const savedHash = fs.readFileSync(hashFile, "utf8").trim();
+    if (!fs.existsSync(hashFile)) {
+      log("Build hash missing, rebuild needed");
 
-      if (savedHash !== currentHash) {
-        log("Source or build flags changed, rebuild needed");
+      return false;
+    }
 
-        return false;
-      }
-    } else {
-      fs.writeFileSync(hashFile, currentHash);
+    const savedHash = fs.readFileSync(hashFile, "utf8").trim();
+
+    if (savedHash !== currentHash) {
+      log("Source or build flags changed, rebuild needed");
+
+      return false;
     }
   } catch (error) {
     log(`Hash check failed: ${error.message}, forcing rebuild`);
